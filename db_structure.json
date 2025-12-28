@@ -1,0 +1,32 @@
+{
+  "admin_settings": {
+    "margins": {
+      "gold_999": 500,
+      "gold_9950": 300,
+      "silver_9999": 200,
+      "silver_bars": 100
+    },
+    "market_hours": {
+      "start": "14:00",
+      "end": "23:55"
+    }
+  },
+  "live_rates": {
+    "gold": {
+      "mcx_price": 72000,
+      "rate_999": 72500,
+      "rate_9950": 72300,
+      "high": 72800,
+      "low": 71500
+    },
+    "silver": {
+      "mcx_price": 85000,
+      "rate_9999": 85200,
+      "rate_bars": 85100,
+      "high": 86000,
+      "low": 84000
+    },
+    "status": "Live",
+    "last_updated": "2025-12-28 14:30:00"
+  }
+}

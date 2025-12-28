@@ -1,0 +1,6 @@
+smartapi-python
+firebase-admin
+pytz
+logzero
+websocket-client
+pyotp
