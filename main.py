@@ -6,26 +6,27 @@ import logging
 from SmartApi import SmartConnect
 from firebase_admin import credentials, db, initialize_app
 
-import pyotp # Added for TOTP generation
+import pyotp 
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # --- CONFIGURATION ---
 # Angel One Credentials
-API_KEY = "8APG7cjx" 
-# SECRET_KEY is used internally by the SDK or during session generation if required, 
-# but usually SmartConnect requests it in constructor or you handle it. 
-# We'll assume the standard flow.
-# CAUTION: YOU MUST FILL THESE IN
-CLIENT_CODE = "H58009686" 
-PASSWORD = "2000" # Using MPIN as Password based on error "Login by Password is not allowed"
-TOTP_KEY = "QSCHJBD3N2SDKHXVF7OEIYP5T4" # Secret Key for TOTP
+API_KEY = os.getenv("ANGEL_API_KEY")
+CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
+PASSWORD = os.getenv("ANGEL_PASSWORD")
+TOTP_KEY = os.getenv("ANGEL_TOTP_KEY")
 
 # Firebase
-FIREBASE_DB_URL = "https://sd-jewels-default-rtdb.firebaseio.com/" # Verify this URL in your console
-SERVICE_ACCOUNT_FILE = "sd-jewels-firebase-adminsdk-fbsvc-8bfeb4c6ad.json"
+FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL")
+SERVICE_ACCOUNT_FILE = os.getenv("FIREBASE_KEY_PATH")
 
 # Market Configuration
 EXCHANGE = "MCX"
-SYMBOL_GOLD = "GOLD" # You might need the specific token usually
+SYMBOL_GOLD = "GOLD" 
 SYMBOL_SILVER = "SILVER"
 # Note: For real trading, you need the instrument tokens. 
 # We will implement a lookup or you must provide tokens.
