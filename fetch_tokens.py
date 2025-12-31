@@ -40,11 +40,15 @@ try:
             valid_candidates = [c for c in candidates if parse_date(c['expiry']) >= today]
             
             if valid_candidates:
-                nearest = valid_candidates[0]
-                print(f"--- {target} ---")
-                print(f"Symbol: {nearest['symbol']}")
-                print(f"Token: {nearest['token']}")
-                print(f"Expiry: {nearest['expiry']}")
+                print(f"--- {target} Candidates ---")
+                for c in valid_candidates[:15]:
+                    print(f"Name: {c['name']} | Symbol: {c['symbol']} | Token: {c['token']} | Expiry: {c['expiry']} | Type: {c['instrumenttype']}")
+            elif target == "USDINR":
+                 # Fallback search for ANY USDINR
+                 print("--- Broader Search for USDINR ---")
+                 broad = [d for d in scrips if "USDINR" in d['symbol']]
+                 for c in broad[:10]:
+                     print(f"Symbol: {c['symbol']} | Token: {c['token']} | Expiry: {c['expiry']} | Type: {c['instrumenttype']}")
             else:
                 print(f"No valid future contracts found for {target}")
 
