@@ -3,12 +3,24 @@ import datetime
 import pytz
 import json
 import logging
+import sys
+import atexit
+import signal
+import threading
 from SmartApi import SmartConnect
 from firebase_admin import credentials, db, initialize_app, messaging
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 import pyotp 
 import os
 from dotenv import load_dotenv
+from notification_service import (
+    save_admin_token, 
+    send_error_notification, 
+    send_server_stopped_notification,
+    send_server_started_notification
+)
 
 # Load environment variables
 load_dotenv()
@@ -41,6 +53,10 @@ END_MINUTE = 55
 # --- SETUP LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Flask App
+app = Flask(__name__)
+CORS(app)
+
 def get_ist_time():
     return datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
 
@@ -69,6 +85,7 @@ def setup_firebase():
         logging.info("Firebase Connected.")
     except Exception as e:
         logging.error(f"Failed to connect to Firebase: {e}")
+        send_error_notification(f"Failed to connect to Firebase: {str(e)}", "Firebase Error")
         exit(1)
 
 def login_angel_one():
@@ -83,6 +100,7 @@ def login_angel_one():
         return obj
     except Exception as e:
         logging.error(f"Angel One Login Failed: {e}")
+        send_error_notification(f"Angel One Login Failed: {str(e)}", "API Connection Error")
         return None
 
 def get_live_prices(smartApiObj):
@@ -178,179 +196,288 @@ def send_notification(title, body):
     except Exception as e:
         logging.error(f"Failed to send notification: {e}")
 
-def main():
-    setup_firebase()
-    smartApi = login_angel_one()
-    
-    
-    # Load last known values from Firebase instead of hardcoded defaults
+# ===== FLASK API ENDPOINTS =====
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'running',
+        'timestamp': str(datetime.datetime.now()),
+        'server': 'Market Data Server'
+    })
+
+@app.route('/register-admin-token', methods=['POST'])
+def register_admin_token():
+    """Register admin FCM token for notifications"""
     try:
-        ref_live = db.reference('live_rates')
-        stored_data = ref_live.get()
-        if stored_data:
-            last_gold = stored_data.get('gold', {})
-            last_silver = stored_data.get('silver', {})
-            last_usd = stored_data.get('usdinr', {})
-            
-            # Ensure we have price/high/low keys
-            last_gold = {
-                "price": last_gold.get('mcx_price', 72000.0),
-                "high": last_gold.get('high', 72500.0),
-                "low": last_gold.get('low', 71800.0)
-            }
-            last_silver = {
-                "price": last_silver.get('mcx_price', 85000.0),
-                "high": last_silver.get('high', 86000.0),
-                "low": last_silver.get('low', 84500.0)
-            }
-            last_usd = {"price": last_usd.get('price', 83.50)}
-            
-            logging.info(f"Loaded last prices from DB: Gold={last_gold['price']}, Silver={last_silver['price']}, USD={last_usd['price']}")
+        data = request.get_json()
+        token = data.get('token')
+        
+        if not token:
+            return jsonify({'error': 'Token is required'}), 400
+        
+        success = save_admin_token(token)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'Admin token registered successfully'
+            })
         else:
-            # Fallback to hardcoded if nothing in DB
+            return jsonify({
+                'success': False,
+                'error': 'Failed to save token'
+            }), 500
+            
+    except Exception as e:
+        logging.error(f"Error registering admin token: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/send-test-notification', methods=['POST'])
+def send_test_notification():
+    """Send a test notification to all admin devices"""
+    try:
+        data = request.get_json() or {}
+        message = data.get('message', 'This is a test notification from the server')
+        
+        success = send_error_notification(message, "Test Notification")
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'Test notification sent'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to send notification'
+            }), 500
+            
+    except Exception as e:
+        logging.error(f"Error sending test notification: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ===== MARKET MONITORING LOOP =====
+
+def run_market_monitor():
+    """Main market monitoring loop"""
+    try:
+        smartApi = login_angel_one()
+        
+        # Load last known values from Firebase instead of hardcoded defaults
+        try:
+            ref_live = db.reference('live_rates')
+            stored_data = ref_live.get()
+            if stored_data:
+                last_gold = stored_data.get('gold', {})
+                last_silver = stored_data.get('silver', {})
+                last_usd = stored_data.get('usdinr', {})
+                
+                # Ensure we have price/high/low keys
+                last_gold = {
+                    "price": last_gold.get('mcx_price', 72000.0),
+                    "high": last_gold.get('high', 72500.0),
+                    "low": last_gold.get('low', 71800.0)
+                }
+                last_silver = {
+                    "price": last_silver.get('mcx_price', 85000.0),
+                    "high": last_silver.get('high', 86000.0),
+                    "low": last_silver.get('low', 84500.0)
+                }
+                last_usd = {"price": last_usd.get('price', 83.50)}
+                
+                logging.info(f"Loaded last prices from DB: Gold={last_gold['price']}, Silver={last_silver['price']}, USD={last_usd['price']}")
+            else:
+                # Fallback to hardcoded if nothing in DB
+                last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0}
+                last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0}
+                last_usd = {"price": 83.50}
+                logging.info("No data in Firebase, using hardcoded defaults")
+        except Exception as e:
+            logging.warning(f"Failed to load last prices from Firebase: {e}. Using hardcoded defaults.")
             last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0}
             last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0}
             last_usd = {"price": 83.50}
-            logging.info("No data in Firebase, using hardcoded defaults")
-    except Exception as e:
-        logging.warning(f"Failed to load last prices from Firebase: {e}. Using hardcoded defaults.")
-        last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0}
-        last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0}
-        last_usd = {"price": 83.50}
 
-    if not smartApi:
-        logging.warning("Mock Mode - Fix Credentials")
+        if not smartApi:
+            logging.warning("Mock Mode - Fix Credentials")
+            send_error_notification("Angel One API login failed. Server running in mock mode.", "API Warning")
 
-    logging.info("Robot Started. Waiting for Market...")
-    
-    # State Tracking
-    was_market_open = is_market_open() # Initial state
-    logging.info(f"Initial Market State: {'Open' if was_market_open else 'Closed'}")
+        logging.info("Robot Started. Waiting for Market...")
+        
+        # State Tracking
+        was_market_open = is_market_open() # Initial state
+        logging.info(f"Initial Market State: {'Open' if was_market_open else 'Closed'}")
 
-    while True:
-        try:
-            market_open = is_market_open()
-            
-            # Check for State Transition
-            if market_open and not was_market_open:
-                # Closed -> Open
-                send_notification("Market Opened", "Values are live now! Check the latest Gold & Silver rates.")
-                was_market_open = True
-            elif not market_open and was_market_open:
-                # Open -> Closed
-                send_notification("Market Closed", "Market has closed for the day. See you tomorrow!")
-                was_market_open = False
-
-            if market_open:
-                # 1. Get Settings
-                try:
-                    ref_settings = db.reference('admin_settings')
-                    settings = ref_settings.get() or {}
-                except:
-                    settings = {}
+        while True:
+            try:
+                market_open = is_market_open()
                 
-                margins = settings.get('margins', {})
-                # Default margins if missing
-                m_gold_999 = float(margins.get('gold_999', 0))
-                m_gold_9950 = float(margins.get('gold_9950', 0))
-                m_silver_9999 = float(margins.get('silver_9999', 0))
-                m_silver_bars = float(margins.get('silver_bars', 0))
-                m_usd_premium = float(margins.get('usd_premium', 0.0))
-                m_gold_spot_premium = float(margins.get('gold_spot_premium', 0.0))
-                m_silver_spot_premium = float(margins.get('silver_spot_premium', 0.0))
-                
-                logging.info(f"DEBUG: Margins -> USD Prem: {m_usd_premium}, Gold Spot Prem: {m_gold_spot_premium}")
+                # Check for State Transition
+                if market_open and not was_market_open:
+                    # Closed -> Open
+                    send_notification("Market Opened", "Values are live now! Check the latest Gold & Silver rates.")
+                    was_market_open = True
+                elif not market_open and was_market_open:
+                    # Open -> Closed
+                    send_notification("Market Closed", "Market has closed for the day. See you tomorrow!")
+                    was_market_open = False
 
-                # 2. Get Live Data
-                if smartApi:
-                    g_data, s_data, u_data = get_live_prices(smartApi)
+                if market_open:
+                    # 1. Get Settings
+                    try:
+                        ref_settings = db.reference('admin_settings')
+                        settings = ref_settings.get() or {}
+                    except:
+                        settings = {}
                     
-                    # Update if valid
-                    if g_data['price'] > 0: last_gold = g_data
-                    if s_data['price'] > 0: last_silver = s_data
-                    if u_data['price'] > 0: last_usd = u_data
-                
-                # 3. Calculate Derived Rates
-                # Gold
-                gold_mcx = last_gold['price']
-                gold_999 = gold_mcx + m_gold_999
-                gold_9950 = gold_mcx + m_gold_9950
-                
-                # Silver
-                silver_mcx = last_silver['price']
-                silver_9999 = silver_mcx + m_silver_9999
-                silver_bars = silver_mcx + m_silver_bars 
+                    margins = settings.get('margins', {})
+                    # Default margins if missing
+                    m_gold_999 = float(margins.get('gold_999', 0))
+                    m_gold_9950 = float(margins.get('gold_9950', 0))
+                    m_silver_9999 = float(margins.get('silver_9999', 0))
+                    m_silver_bars = float(margins.get('silver_bars', 0))
+                    m_usd_premium = float(margins.get('usd_premium', 0.0))
+                    m_gold_spot_premium = float(margins.get('gold_spot_premium', 0.0))
+                    m_silver_spot_premium = float(margins.get('silver_spot_premium', 0.0))
+                    
+                    logging.info(f"DEBUG: Margins -> USD Prem: {m_usd_premium}, Gold Spot Prem: {m_gold_spot_premium}")
 
-                # Spot Calculation
-                raw_usd = last_usd['price'] if last_usd['price'] > 0 else 83.50
-                usd_rate = raw_usd + m_usd_premium # Apply Premium -> Effective USD
-                
-                # Formulas:
-                # Gold Spot ($) = (MCX Gold / 10) / (USD * Factor) * 31.1035
-                # Silver Spot ($) = (MCX Silver / 1000) / (USD * Factor) * 31.1035
-                
-                # Adjusted factor based on market feedback (4515/4294 ~= 1.05 boost required -> Lower divisor)
-                # Previous factor 1.15 gave ~4294. User wants ~4515.
-                # New Factor ~= 1.0935
-                factor = 1.0935
-                troy_oz = 31.1035
-                
-                gold_spot = 0.0
-                if gold_mcx > 0:
-                     # Calculate Base Spot + Add Premium
-                     gold_spot = ((gold_mcx / 10) / (usd_rate * factor) * troy_oz) + m_gold_spot_premium
-                
-                silver_spot = 0.0
-                if silver_mcx > 0:
-                     # Calculate Base Spot + Add Premium
-                     silver_spot = ((silver_mcx / 1000) / (usd_rate * factor) * troy_oz) + m_silver_spot_premium
+                    # 2. Get Live Data
+                    if smartApi:
+                        g_data, s_data, u_data = get_live_prices(smartApi)
+                        
+                        # Update if valid
+                        if g_data['price'] > 0: last_gold = g_data
+                        if s_data['price'] > 0: last_silver = s_data
+                        if u_data['price'] > 0: last_usd = u_data
+                    
+                    # 3. Calculate Derived Rates
+                    # Gold
+                    gold_mcx = last_gold['price']
+                    gold_999 = gold_mcx + m_gold_999
+                    gold_9950 = gold_mcx + m_gold_9950
+                    
+                    # Silver
+                    silver_mcx = last_silver['price']
+                    silver_9999 = silver_mcx + m_silver_9999
+                    silver_bars = silver_mcx + m_silver_bars 
 
-                # 4. Update Firebase
-                ref_live = db.reference('live_rates')
-                payload = {
-                    'gold': {
-                        'mcx_price': gold_mcx,
-                        'rate_999': gold_999,
-                        'rate_9950': gold_9950,
-                        'spot_price': round(gold_spot, 2),
-                        'high': last_gold['high'],
-                        'low': last_gold['low']
-                    },
-                    'silver': {
-                        'mcx_price': silver_mcx,
-                        'rate_9999': silver_9999,
-                        'rate_bars': silver_bars,
-                        'spot_price': round(silver_spot, 2),
-                        'high': last_silver['high'],
-                        'low': last_silver['low']
-                    },
-                    'usdinr': {
-                        'price': usd_rate # Send Effective Rate (Raw + Premium)
-                    },
-                    'last_updated': str(datetime.datetime.now()),
-                    'status': 'Live'
-                }
-                ref_live.set(payload)
-                
-                logging.info(f"Updated: G999={gold_999} S9999={silver_9999} USD={last_usd['price']}")
-            else:
-                db.reference('live_rates/status').set('Market Closed')
-                logging.info("Market Closed.")
-                time.sleep(60)
+                    # Spot Calculation
+                    raw_usd = last_usd['price'] if last_usd['price'] > 0 else 83.50
+                    usd_rate = raw_usd + m_usd_premium # Apply Premium -> Effective USD
+                    
+                    # Formulas:
+                    # Gold Spot ($) = (MCX Gold / 10) / (USD * Factor) * 31.1035
+                    # Silver Spot ($) = (MCX Silver / 1000) / (USD * Factor) * 31.1035
+                    
+                    # Adjusted factor based on market feedback (4515/4294 ~= 1.05 boost required -> Lower divisor)
+                    # Previous factor 1.15 gave ~4294. User wants ~4515.
+                    # New Factor ~= 1.0935
+                    factor = 1.0935
+                    troy_oz = 31.1035
+                    
+                    gold_spot = 0.0
+                    if gold_mcx > 0:
+                         # Calculate Base Spot + Add Premium
+                         gold_spot = ((gold_mcx / 10) / (usd_rate * factor) * troy_oz) + m_gold_spot_premium
+                    
+                    silver_spot = 0.0
+                    if silver_mcx > 0:
+                         # Calculate Base Spot + Add Premium
+                         silver_spot = ((silver_mcx / 1000) / (usd_rate * factor) * troy_oz) + m_silver_spot_premium
 
-            time.sleep(0.05)
+                    # 4. Update Firebase
+                    ref_live = db.reference('live_rates')
+                    payload = {
+                        'gold': {
+                            'mcx_price': gold_mcx,
+                            'rate_999': gold_999,
+                            'rate_9950': gold_9950,
+                            'spot_price': round(gold_spot, 2),
+                            'high': last_gold['high'],
+                            'low': last_gold['low']
+                        },
+                        'silver': {
+                            'mcx_price': silver_mcx,
+                            'rate_9999': silver_9999,
+                            'rate_bars': silver_bars,
+                            'spot_price': round(silver_spot, 2),
+                            'high': last_silver['high'],
+                            'low': last_silver['low']
+                        },
+                        'usdinr': {
+                            'price': usd_rate # Send Effective Rate (Raw + Premium)
+                        },
+                        'last_updated': str(datetime.datetime.now()),
+                        'status': 'Live'
+                    }
+                    ref_live.set(payload)
+                    
+                    logging.info(f"Updated: G999={gold_999} S9999={silver_9999} USD={last_usd['price']}")
+                else:
+                    db.reference('live_rates/status').set('Market Closed')
+                    logging.info("Market Closed.")
+                    time.sleep(60)
 
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logging.error(f"Loop Error: {e}")
-            time.sleep(5)
+                time.sleep(0.05)
 
+            except KeyboardInterrupt:
+                logging.info("Market monitor interrupted by user")
+                break
+            except Exception as e:
+                error_msg = f"Loop Error: {str(e)}"
+                logging.error(error_msg)
+                send_error_notification(error_msg, "Market Monitor Error")
+                time.sleep(5)
 
-            break
-        except Exception as e:
-            logging.error(f"Loop Error: {e}")
-            time.sleep(5)
+    except Exception as e:
+        error_msg = f"Fatal error in market monitor: {str(e)}"
+        logging.error(error_msg)
+        send_error_notification(error_msg, "Fatal Server Error")
+        raise
+
+# ===== CLEANUP HANDLERS =====
+
+def cleanup_handler():
+    """Called when server is shutting down"""
+    logging.info("Server shutting down...")
+    send_server_stopped_notification()
+
+def signal_handler(signum, frame):
+    """Handle termination signals"""
+    logging.info(f"Received signal {signum}")
+    cleanup_handler()
+    sys.exit(0)
+
+# Register cleanup handlers
+atexit.register(cleanup_handler)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ===== MAIN =====
+
+def main():
+    try:
+        setup_firebase()
+        
+        # Send server started notification
+        send_server_started_notification()
+        
+        # Start market monitor in a separate thread
+        monitor_thread = threading.Thread(target=run_market_monitor, daemon=True)
+        monitor_thread.start()
+        
+        # Run Flask server (blocking)
+        logging.info("Starting Flask API server on port 5000...")
+        app.run(host='0.0.0.0', port=5000, debug=False)
+        
+    except Exception as e:
+        error_msg = f"Fatal error: {str(e)}"
+        logging.error(error_msg)
+        send_error_notification(error_msg, "Server Crash")
+        raise
 
 if __name__ == "__main__":
     main()
