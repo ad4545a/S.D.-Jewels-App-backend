@@ -1,0 +1,17 @@
+[Unit]
+Description=Market Monitor & Flask API Server
+After=network.target
+
+[Service]
+User={{USER}}
+Group={{USER}}
+WorkingDirectory={{PROJECT_PATH}}
+# Environment variables can be loaded from .env explicitly if needed, 
+# but python-dotenv in main.py handles it if CWD is correct.
+Environment="PATH={{PROJECT_PATH}}/.venv/bin"
+ExecStart={{PROJECT_PATH}}/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

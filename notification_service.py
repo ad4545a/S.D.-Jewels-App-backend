@@ -1,7 +1,44 @@
 import json
 import os
 import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from firebase_admin import messaging
+
+ADMIN_TOKENS_FILE = "admin_tokens.json"
+
+def send_email(subject, body):
+    """Send an email notification using Gmail SMTP"""
+    sender_email = os.getenv("SMTP_EMAIL")
+    sender_password = os.getenv("SMTP_PASSWORD")
+    receiver_email = os.getenv("SMTP_RECEIVER") or "ad4545a@gmail.com" # Default to user's email
+
+    if not sender_email or not sender_password:
+        logging.warning("SMTP credentials not found. Skipping email notification.")
+        return False
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = receiver_email
+        msg['Subject'] = f"[Market Monitor] {subject}"
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Connect to Gmail SMTP Server
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        text = msg.as_string()
+        server.sendmail(sender_email, receiver_email, text)
+        server.quit()
+        
+        logging.info(f"Email sent to {receiver_email}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send email: {e}")
+        return False
 
 ADMIN_TOKENS_FILE = "admin_tokens.json"
 
@@ -39,13 +76,17 @@ def save_admin_token(token):
         return False
 
 def send_error_notification(error_message, error_type="Server Error"):
-    """Send error notification to all admin devices"""
+    """Send error notification to all admin devices and via Email"""
     try:
+        # 1. Send Email (Always try this first)
+        email_success = send_email(f"Error: {error_type}", f"Error Details:\n{error_message}")
+        
+        # 2. Send Mobile Notifications (if tokens exist)
         tokens = load_admin_tokens()
         
         if not tokens:
-            logging.warning("No admin tokens registered. Cannot send notification.")
-            return False
+            logging.warning("No admin tokens registered. Skipping mobile notification.")
+            return email_success
         
         # Create notification messages for each token
         messages = []
@@ -72,7 +113,7 @@ def send_error_notification(error_message, error_type="Server Error"):
         failure_count = len(response.responses) - success_count
         
         # Log results
-        logging.info(f"Notification sent: {success_count} success, {failure_count} failed")
+        logging.info(f"Notification sent: {success_count} mobile success, {failure_count} failed")
         
         # Remove invalid tokens
         if failure_count > 0:
@@ -85,14 +126,13 @@ def send_error_notification(error_message, error_type="Server Error"):
             # Clean up invalid tokens
             remove_invalid_tokens(failed_tokens)
         
-        return success_count > 0
+        return (success_count > 0) or email_success
         
     except Exception as e:
         logging.error(f"Failed to send error notification: {e}")
         import traceback
         logging.error(traceback.format_exc())
         return False
-
 def remove_invalid_tokens(invalid_tokens):
     """Remove invalid FCM tokens from storage"""
     try:

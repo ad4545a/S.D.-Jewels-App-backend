@@ -60,6 +60,23 @@ CORS(app)
 def get_ist_time():
     return datetime.datetime.now(pytz.timezone('Asia/Kolkata'))
 
+# Throttling for error notifications to avoid spam
+last_error_notif_time = 0
+MIN_NOTIF_INTERVAL = 300 # 5 minutes
+
+def notify_error_throttled(message, title="API Error"):
+    global last_error_notif_time
+    try:
+        current_time = time.time()
+        if current_time - last_error_notif_time > MIN_NOTIF_INTERVAL:
+            send_error_notification(message, title)
+            last_error_notif_time = current_time
+            logging.info(f"Throttled Error Notification Sent: {message}")
+        else:
+            logging.warning(f"Error Notification Suppressed (Throttling): {message}")
+    except Exception as e:
+        logging.error(f"Failed to send throttled notification: {e}")
+
 def is_market_open():
     now = get_ist_time()
     # logging.info(f"DEBUG: Checking Time. Now={now}, Weekday={now.weekday()}")
@@ -109,8 +126,8 @@ def get_live_prices(smartApiObj):
     token_silver = "451666" # SILVER05MAR26FUT
     token_usdinr = "1" # USDINR Spot Rate
     
-    gold_data_out = {"price": 0.0, "high": 0.0, "low": 0.0}
-    silver_data_out = {"price": 0.0, "high": 0.0, "low": 0.0}
+    gold_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0}
+    silver_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0}
     usd_data_out = {"price": 0.0}
 
     try:
@@ -118,7 +135,7 @@ def get_live_prices(smartApiObj):
         tokens_mcx = {"MCX": [token_gold, token_silver]}
         res_mcx = smartApiObj.getMarketData("FULL", tokens_mcx)
         
-        if res_mcx['status'] and res_mcx['data']:
+        if res_mcx.get('status') and res_mcx.get('data'):
             fetched_list = res_mcx['data']['fetched']
             
             # Process results (Order isn't guaranteed, map by symbol or token)
@@ -141,16 +158,33 @@ def get_live_prices(smartApiObj):
                     target_dict = silver_data_out
                 
                 if target_dict is not None:
-                    depth = item.get('depth', {}).get('sell', [])
-                    if depth:
-                        target_dict['price'] = float(depth[0]['price'])
+                    # Ask Price (Sell Depth)
+                    depth_sell = item.get('depth', {}).get('sell', [])
+                    if depth_sell:
+                        target_dict['price'] = float(depth_sell[0]['price'])
                     else:
                         target_dict['price'] = float(item.get('ltp', 0.0))
+
+                    # Bid Price (Buy Depth)
+                    depth_buy = item.get('depth', {}).get('buy', [])
+                    if depth_buy:
+                         target_dict['bid'] = float(depth_buy[0]['price'])
+                    else:
+                         # Fallback to LTP if no depth
+                         target_dict['bid'] = float(item.get('ltp', 0.0))
+
                     target_dict['high'] = float(item.get('high', 0.0))
                     target_dict['low'] = float(item.get('low', 0.0))
+        elif not res_mcx.get('status'):
+            if res_mcx.get('errorCode') == 'AG8001' or res_mcx.get('message') == 'Invalid Token':
+                 raise Exception("Invalid Token")
 
     except Exception as e:
-        logging.warning(f"Failed to fetch MCX Data: {e}")
+        if "Invalid Token" in str(e):
+             raise
+        error_msg = f"Failed to fetch MCX Data: {e}"
+        logging.warning(error_msg)
+        notify_error_throttled(error_msg, "MCX API Error")
 
     # No sleep between MCX and CDS needed if we want speed, maybe tiny yield?
     # time.sleep(0.05) 
@@ -163,7 +197,7 @@ def get_live_prices(smartApiObj):
         # Debug: Log the response to see what we're getting
         logging.info(f"USDINR API Response: status={res_usd.get('status')}, data={res_usd.get('data')}")
         
-        if res_usd['status'] and res_usd['data']:
+        if res_usd.get('status') and res_usd.get('data'):
             fetched = res_usd['data'].get('fetched', [])
             if fetched and len(fetched) > 0:
                 ltp = fetched[0].get('ltp', 0.0)
@@ -174,11 +208,18 @@ def get_live_prices(smartApiObj):
                     logging.warning(f"USDINR LTP is 0.0, keeping last value")
             else:
                 logging.warning("USDINR: No data in fetched array")
+        elif not res_usd.get('status'):
+             if res_usd.get('errorCode') == 'AG8001' or res_usd.get('message') == 'Invalid Token':
+                 raise Exception("Invalid Token")
               
               # We can get change percentage if needed from FULL, but LTP is basic start.
              
     except Exception as e:
-        logging.warning(f"Failed to fetch USDINR: {e}")
+        if "Invalid Token" in str(e):
+             raise
+        error_msg = f"Failed to fetch USDINR: {e}"
+        logging.warning(error_msg)
+        notify_error_throttled(error_msg, "USDINR API Error")
         
     return gold_data_out, silver_data_out, usd_data_out
 
@@ -278,26 +319,28 @@ def run_market_monitor():
                 last_gold = {
                     "price": last_gold.get('mcx_price', 72000.0),
                     "high": last_gold.get('high', 72500.0),
-                    "low": last_gold.get('low', 71800.0)
+                    "low": last_gold.get('low', 71800.0),
+                    "bid": last_gold.get('bid', 71990.0) # Load bid or default
                 }
                 last_silver = {
                     "price": last_silver.get('mcx_price', 85000.0),
                     "high": last_silver.get('high', 86000.0),
-                    "low": last_silver.get('low', 84500.0)
+                    "low": last_silver.get('low', 84500.0),
+                    "bid": last_silver.get('bid', 84950.0) # Load bid or default
                 }
                 last_usd = {"price": last_usd.get('price', 83.50)}
                 
                 logging.info(f"Loaded last prices from DB: Gold={last_gold['price']}, Silver={last_silver['price']}, USD={last_usd['price']}")
             else:
                 # Fallback to hardcoded if nothing in DB
-                last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0}
-                last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0}
+                last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0, "bid": 71950.0}
+                last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0, "bid": 84900.0}
                 last_usd = {"price": 83.50}
                 logging.info("No data in Firebase, using hardcoded defaults")
         except Exception as e:
             logging.warning(f"Failed to load last prices from Firebase: {e}. Using hardcoded defaults.")
-            last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0}
-            last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0}
+            last_gold = {"price": 72000.0, "high": 72500.0, "low": 71800.0, "bid": 71950.0}
+            last_silver = {"price": 85000.0, "high": 86000.0, "low": 84500.0, "bid": 84900.0}
             last_usd = {"price": 83.50}
 
         if not smartApi:
@@ -324,104 +367,118 @@ def run_market_monitor():
                     send_notification("Market Closed", "Market has closed for the day. See you tomorrow!")
                     was_market_open = False
 
-                if market_open:
-                    # 1. Get Settings
-                    try:
-                        ref_settings = db.reference('admin_settings')
-                        settings = ref_settings.get() or {}
-                    except:
-                        settings = {}
-                    
-                    margins = settings.get('margins', {})
-                    # Default margins if missing
-                    m_gold_999 = float(margins.get('gold_999', 0))
-                    m_gold_9950 = float(margins.get('gold_9950', 0))
-                    m_silver_9999 = float(margins.get('silver_9999', 0))
-                    m_silver_bars = float(margins.get('silver_bars', 0))
-                    m_usd_premium = float(margins.get('usd_premium', 0.0))
-                    m_gold_spot_premium = float(margins.get('gold_spot_premium', 0.0))
-                    m_silver_spot_premium = float(margins.get('silver_spot_premium', 0.0))
-                    
-                    logging.info(f"DEBUG: Margins -> USD Prem: {m_usd_premium}, Gold Spot Prem: {m_gold_spot_premium}")
 
-                    # 2. Get Live Data
-                    if smartApi:
+                # 1. Get Settings (ALWAYS fetch to pick up premium changes)
+                try:
+                    ref_settings = db.reference('admin_settings')
+                    settings = ref_settings.get() or {}
+                except:
+                    settings = {}
+                
+                margins = settings.get('margins', {})
+                # Default margins if missing
+                m_gold_999 = float(margins.get('gold_999', 0))
+                m_gold_9950 = float(margins.get('gold_9950', 0))
+                m_silver_9999 = float(margins.get('silver_9999', 0))
+                m_silver_bars = float(margins.get('silver_bars', 0))
+                m_usd_premium = float(margins.get('usd_premium', 0.0))
+                m_gold_spot_premium = float(margins.get('gold_spot_premium', 0.0))
+                m_silver_spot_premium = float(margins.get('silver_spot_premium', 0.0))
+
+                # 2. Get Live Data (ONLY if Market Open)
+                if market_open and smartApi:
+                    try:
                         g_data, s_data, u_data = get_live_prices(smartApi)
                         
                         # Update if valid
                         if g_data['price'] > 0: last_gold = g_data
                         if s_data['price'] > 0: last_silver = s_data
                         if u_data['price'] > 0: last_usd = u_data
-                    
-                    # 3. Calculate Derived Rates
-                    # Gold
-                    gold_mcx = last_gold['price']
-                    gold_999 = gold_mcx + m_gold_999
-                    gold_9950 = gold_mcx + m_gold_9950
-                    
-                    # Silver
-                    silver_mcx = last_silver['price']
-                    silver_9999 = silver_mcx + m_silver_9999
-                    silver_bars = silver_mcx + m_silver_bars 
+                    except Exception as e:
+                        if "Invalid Token" in str(e):
+                            logging.info("Token Expired (Invalid Token). Attempting to re-login...")
+                            new_api_session = login_angel_one()
+                            if new_api_session:
+                                smartApi = new_api_session
+                                logging.info("Re-login Successful. Resuming data fetch.")
+                            else:
+                                logging.error("Re-login Failed.")
+                        else:
+                            logging.error(f"Error fetching live prices: {e}")
+                            notify_error_throttled(f"Error fetching live prices: {e}", "Live Data Error")
 
-                    # Spot Calculation
-                    raw_usd = last_usd['price'] if last_usd['price'] > 0 else 83.50
-                    usd_rate = raw_usd + m_usd_premium # Apply Premium -> Effective USD
-                    
-                    # Formulas:
-                    # Gold Spot ($) = (MCX Gold / 10) / (USD * Factor) * 31.1035
-                    # Silver Spot ($) = (MCX Silver / 1000) / (USD * Factor) * 31.1035
-                    
-                    # Adjusted factor based on market feedback (4515/4294 ~= 1.05 boost required -> Lower divisor)
-                    # Previous factor 1.15 gave ~4294. User wants ~4515.
-                    # New Factor ~= 1.0935
-                    factor = 1.0935
-                    troy_oz = 31.1035
-                    
-                    gold_spot = 0.0
-                    if gold_mcx > 0:
-                         # Calculate Base Spot + Add Premium
-                         gold_spot = ((gold_mcx / 10) / (usd_rate * factor) * troy_oz) + m_gold_spot_premium
-                    
-                    silver_spot = 0.0
-                    if silver_mcx > 0:
-                         # Calculate Base Spot + Add Premium
-                         silver_spot = ((silver_mcx / 1000) / (usd_rate * factor) * troy_oz) + m_silver_spot_premium
+                # 3. Calculate Derived Rates (ALWAYS, using last known data + new margins)
+                # Gold
+                gold_mcx = last_gold['price']
+                gold_999 = gold_mcx + m_gold_999
+                gold_9950 = gold_mcx + m_gold_9950
+                
+                # Silver
+                silver_mcx = last_silver['price']
+                silver_9999 = silver_mcx + m_silver_9999
+                silver_bars = silver_mcx + m_silver_bars 
 
-                    # 4. Update Firebase
-                    ref_live = db.reference('live_rates')
-                    payload = {
-                        'gold': {
-                            'mcx_price': gold_mcx,
-                            'rate_999': gold_999,
-                            'rate_9950': gold_9950,
-                            'spot_price': round(gold_spot, 2),
-                            'high': last_gold['high'],
-                            'low': last_gold['low']
-                        },
-                        'silver': {
-                            'mcx_price': silver_mcx,
-                            'rate_9999': silver_9999,
-                            'rate_bars': silver_bars,
-                            'spot_price': round(silver_spot, 2),
-                            'high': last_silver['high'],
-                            'low': last_silver['low']
-                        },
-                        'usdinr': {
-                            'price': usd_rate # Send Effective Rate (Raw + Premium)
-                        },
-                        'last_updated': str(datetime.datetime.now()),
-                        'status': 'Live'
-                    }
-                    ref_live.set(payload)
-                    
-                    logging.info(f"Updated: G999={gold_999} S9999={silver_9999} USD={last_usd['price']}")
+                # Spot Calculation
+                raw_usd = last_usd['price'] if last_usd['price'] > 0 else 83.50
+                usd_rate = raw_usd + m_usd_premium # Apply Premium -> Effective USD
+                
+                # Formulas:
+                # Gold Spot ($) = (MCX Gold / 10) / (USD * Factor) * 31.1035
+                # Silver Spot ($) = (MCX Silver / 1000) / (USD * Factor) * 31.1035
+                
+                factor = 1.0935
+                troy_oz = 31.1035
+                
+                gold_spot = 0.0
+                if gold_mcx > 0:
+                        gold_spot = ((gold_mcx / 10) / (usd_rate * factor) * troy_oz) + m_gold_spot_premium
+                
+                silver_spot = 0.0
+                if silver_mcx > 0:
+                        silver_spot = ((silver_mcx / 1000) / (usd_rate * factor) * troy_oz) + m_silver_spot_premium
+
+                # 4. Update Firebase (ALWAYS)
+                ref_live = db.reference('live_rates')
+                
+                # Determine status string
+                status_str = 'Live' if market_open else 'Market Closed'
+                
+                payload = {
+                    'gold': {
+                        'mcx_price': gold_mcx,
+                        'bid': last_gold.get('bid', gold_mcx - 10), # Include BID
+                        'rate_999': gold_999,
+                        'rate_9950': gold_9950,
+                        'spot_price': round(gold_spot, 2),
+                        'high': last_gold['high'],
+                        'low': last_gold['low']
+                    },
+                    'silver': {
+                        'mcx_price': silver_mcx,
+                        'bid': last_silver.get('bid', silver_mcx - 50), # Include BID
+                        'rate_9999': silver_9999,
+                        'rate_bars': silver_bars,
+                        'spot_price': round(silver_spot, 2),
+                        'high': last_silver['high'],
+                        'low': last_silver['low']
+                    },
+                    'usdinr': {
+                        'price': usd_rate
+                    },
+                    'last_updated': str(datetime.datetime.now()),
+                    'status': status_str
+                }
+                ref_live.set(payload)
+                
+                # Log occasionally (every ~60s if closed, else verbose?)
+                # For now keeping verbose logic simple or reducing spam if closed?
+                # Let's log updates.
+                if market_open:
+                     logging.info(f"Updated: G999={gold_999} S9999={silver_9999}")
+                     time.sleep(0.05) # Fast updates when open
                 else:
-                    db.reference('live_rates/status').set('Market Closed')
-                    logging.info("Market Closed.")
-                    time.sleep(60)
-
-                time.sleep(0.05)
+                     logging.info(f"Updated (Closed): G999={gold_999} S9999={silver_9999}")
+                     time.sleep(5) # Slower updates when closed to save resources, but fast enough for UI tuning
 
             except KeyboardInterrupt:
                 logging.info("Market monitor interrupted by user")
