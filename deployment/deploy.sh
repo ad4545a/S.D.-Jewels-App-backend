@@ -75,6 +75,16 @@ fi
 nginx -t
 systemctl restart nginx
 
+# Firewall Configuration (UFW)
+echo -e "${GREEN}Configuring Firewall...${NC}"
+if command -v ufw > /dev/null; then
+    ufw allow 22/tcp
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw allow 5000/tcp # Allow direct access if needed for debugging
+    ufw --force enable
+fi
+
 echo -e "${GREEN}Deployment Complete!${NC}"
 echo "Check status with: systemctl status market_monitor"
 echo "Check logs with: journalctl -u market_monitor -f"

@@ -131,33 +131,35 @@ def get_live_prices(smartApiObj):
     usd_data_out = {"price": 0.0}
 
     try:
-        # Batch Request for MCX (Gold + Silver)
-        tokens_mcx = {"MCX": [token_gold, token_silver]}
-        res_mcx = smartApiObj.getMarketData("FULL", tokens_mcx)
+        # Combine Request for MCX (Gold + Silver) and CDS (USDINR)
+        # Using FULL mode for all to ensure we get Depth for MCX
+        tokens = {
+            "MCX": [token_gold, token_silver],
+            "CDS": [token_usdinr]
+        }
         
-        if res_mcx.get('status') and res_mcx.get('data'):
-            fetched_list = res_mcx['data']['fetched']
-            
-            # Process results (Order isn't guaranteed, map by symbol or token)
-            # Since we only passed tokens, we can match by token or just iterate.
-            # However, the response usually corresponds to the request list or contains the token.
-            # Let's support flexible parsing.
+        res = smartApiObj.getMarketData("FULL", tokens)
+        
+        if res.get('status') and res.get('data'):
+            fetched_list = res['data']['fetched']
             
             for item in fetched_list:
-                tk = item.get('tradingSymbol', '') # Or token could be checked
-                # Note: SmartAPI returns 'tradingSymbol' e.g. "GOLD05FEB26FUT". 
-                # We can also check tokens if returned. Usually they return 'symbolToken'.
-                
                 sym_token = item.get('symbolToken', '')
                 
-                # Determine if this is Gold or Silver
+                # Determine if this is Gold, Silver, or USDINR
                 target_dict = None
                 if sym_token == token_gold:
                     target_dict = gold_data_out
                 elif sym_token == token_silver:
                     target_dict = silver_data_out
-                
-                if target_dict is not None:
+                elif sym_token == token_usdinr:
+                    # Special case for USDINR, we only really need LTP but FULL gives it too
+                    # If target_dict is usd_data_out, we handle it slightly differently below
+                    # or just map 'ltp' to 'price'.
+                    pass 
+
+                # Process MCX Data
+                if sym_token in [token_gold, token_silver]:
                     # Ask Price (Sell Depth)
                     depth_sell = item.get('depth', {}).get('sell', [])
                     if depth_sell:
@@ -170,56 +172,45 @@ def get_live_prices(smartApiObj):
                     if depth_buy:
                          target_dict['bid'] = float(depth_buy[0]['price'])
                     else:
-                         # Fallback to LTP if no depth
                          target_dict['bid'] = float(item.get('ltp', 0.0))
 
                     target_dict['high'] = float(item.get('high', 0.0))
                     target_dict['low'] = float(item.get('low', 0.0))
-        elif not res_mcx.get('status'):
-            if res_mcx.get('errorCode') == 'AG8001' or res_mcx.get('message') == 'Invalid Token':
+                
+                # Process USDINR Data
+                elif sym_token == token_usdinr:
+                    ltp = float(item.get('ltp', 0.0))
+                    if ltp > 0:
+                        usd_data_out['price'] = ltp
+                        logging.info(f"USDINR Updated: {ltp}")
+                    else:
+                        logging.warning(f"USDINR LTP is 0.0, keeping last value")
+
+        elif not res.get('status'):
+            msg = res.get('message', '')
+            err_code = res.get('errorCode', '')
+            if err_code == 'AG8001' or msg == 'Invalid Token':
                  raise Exception("Invalid Token")
-
-    except Exception as e:
-        if "Invalid Token" in str(e):
-             raise
-        error_msg = f"Failed to fetch MCX Data: {e}"
-        logging.warning(error_msg)
-        notify_error_throttled(error_msg, "MCX API Error")
-
-    # No sleep between MCX and CDS needed if we want speed, maybe tiny yield?
-    # time.sleep(0.05) 
-
-    try:
-        # 3. USDINR (CDS)
-        tokens_usd = {"CDS": [token_usdinr]}
-        res_usd = smartApiObj.getMarketData("LTP", tokens_usd) 
-        
-        # Debug: Log the response to see what we're getting
-        logging.info(f"USDINR API Response: status={res_usd.get('status')}, data={res_usd.get('data')}")
-        
-        if res_usd.get('status') and res_usd.get('data'):
-            fetched = res_usd['data'].get('fetched', [])
-            if fetched and len(fetched) > 0:
-                ltp = fetched[0].get('ltp', 0.0)
-                if ltp > 0:
-                    usd_data_out['price'] = float(ltp)
-                    logging.info(f"USDINR Updated: {ltp}")
-                else:
-                    logging.warning(f"USDINR LTP is 0.0, keeping last value")
+            elif "rate" in msg.lower() or "denied" in msg.lower():
+                 raise Exception(f"Rate Limit: {msg}")
             else:
-                logging.warning("USDINR: No data in fetched array")
-        elif not res_usd.get('status'):
-             if res_usd.get('errorCode') == 'AG8001' or res_usd.get('message') == 'Invalid Token':
-                 raise Exception("Invalid Token")
-              
-              # We can get change percentage if needed from FULL, but LTP is basic start.
-             
+                 logging.warning(f"API Error in get_live_prices: {msg}")
+
     except Exception as e:
-        if "Invalid Token" in str(e):
+        error_str = str(e)
+        if "Invalid Token" in error_str:
              raise
-        error_msg = f"Failed to fetch USDINR: {e}"
+        elif "Rate Limit" in error_str:
+             # Propagate rate limit specifically or handle it in loop
+             logging.warning(f"Rate Limit hit in get_live_prices: {e}")
+             raise Exception(f"Rate Limit Hit: {e}") # Raise to trigger backoff
+        elif "Connection aborted" in error_str or "RemoteDisconnected" in error_str:
+             logging.warning(f"Connection dropped in get_live_prices: {e}")
+             raise Exception(f"Connection Error: {e}")
+
+        error_msg = f"Failed to fetch Market Data: {e}"
         logging.warning(error_msg)
-        notify_error_throttled(error_msg, "USDINR API Error")
+        notify_error_throttled(error_msg, "API Fetch Error")
         
     return gold_data_out, silver_data_out, usd_data_out
 
@@ -236,6 +227,59 @@ def send_notification(title, body):
         logging.info(f"Notification Sent: {title} - {response}")
     except Exception as e:
         logging.error(f"Failed to send notification: {e}")
+
+# ===== APP ACCESS CONTROL =====
+
+def is_app_active(app_id):
+    """Check if a specific client app is active"""
+    try:
+        status = db.reference(f"apps/{app_id}/active").get()
+        return status is True
+    except Exception as e:
+        logging.error(f"Error checking status for {app_id}: {e}")
+        return False # Fail safe: default to inactive if check fails? Or active?
+        # User requirement: "Fail-Safe ... No data must be readable". 
+        # But this function is for server-side push logic if needed, 
+        # main security is in Firebase Rules.
+        # Let's return False to be safe.
+
+@app.route('/admin/set-app-status', methods=['POST'])
+def update_app_status():
+    """Admin API to enable/disable a client app"""
+    try:
+        data = request.get_json()
+        app_id = data.get('app_id')
+        active = data.get('active')
+        reason = data.get('reason', '')
+        
+        if not app_id or active is None:
+             return jsonify({'error': 'app_id and active status are required'}), 400
+
+        # Validate app_id
+        valid_apps = ["sd_jewels", "pk_sons", "yash_traders"]
+        if app_id not in valid_apps:
+            return jsonify({'error': 'Invalid app_id. Must be one of: ' + ", ".join(valid_apps)}), 400
+
+        # Update Firebase
+        ref = db.reference(f"apps/{app_id}")
+        payload = {
+            "active": bool(active),
+            "reason": str(reason),
+            "last_updated": str(datetime.datetime.now())
+        }
+        ref.update(payload)
+        
+        logging.info(f"App Status Updated: {app_id} -> {'Active' if active else 'Inactive'} (Reason: {reason})")
+        
+        return jsonify({
+            'success': True,
+            'message': f"App {app_id} is now {'Active' if active else 'Inactive'}",
+            'data': payload
+        })
+
+    except Exception as e:
+        logging.error(f"Error setting app status: {e}")
+        return jsonify({'error': str(e)}), 500
 
 # ===== FLASK API ENDPOINTS =====
 
@@ -395,14 +439,17 @@ def run_market_monitor():
                         if s_data['price'] > 0: last_silver = s_data
                         if u_data['price'] > 0: last_usd = u_data
                     except Exception as e:
-                        if "Invalid Token" in str(e):
-                            logging.info("Token Expired (Invalid Token). Attempting to re-login...")
+                        if "Invalid Token" in str(e) or "Connection Error" in str(e):
+                            logging.info(f"Connection issue ({e}). Attempting to re-login...")
                             new_api_session = login_angel_one()
                             if new_api_session:
                                 smartApi = new_api_session
                                 logging.info("Re-login Successful. Resuming data fetch.")
                             else:
                                 logging.error("Re-login Failed.")
+                        elif "Rate Limit" in str(e):
+                            logging.warning("Action Required: Rate Limit Hit. Sleeping for 2s...")
+                            time.sleep(2.0)
                         else:
                             logging.error(f"Error fetching live prices: {e}")
                             notify_error_throttled(f"Error fetching live prices: {e}", "Live Data Error")
@@ -475,7 +522,9 @@ def run_market_monitor():
                 # Let's log updates.
                 if market_open:
                      logging.info(f"Updated: G999={gold_999} S9999={silver_9999}")
-                     time.sleep(0.05) # Fast updates when open
+                     # Rate Limit Guard: 0.5s sleep ensures we don't exceed ~3 req/sec 
+                     # (Actually with 1 call per loop, 0.5s is ~2 req/sec safe).
+                     time.sleep(0.5) 
                 else:
                      logging.info(f"Updated (Closed): G999={gold_999} S9999={silver_9999}")
                      time.sleep(5) # Slower updates when closed to save resources, but fast enough for UI tuning
