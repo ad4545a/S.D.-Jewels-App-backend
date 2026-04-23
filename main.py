@@ -657,19 +657,31 @@ atexit.register(cleanup_handler)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# ===== MAIN =====
+# ===== INITIALIZATION (For Gunicorn) =====
+_server_initialized = False
+def initialize_server():
+    global _server_initialized
+    if not _server_initialized:
+        try:
+            setup_firebase()
+            send_server_started_notification()
+            
+            # Start market monitor in a separate thread
+            monitor_thread = threading.Thread(target=run_market_monitor, daemon=True)
+            monitor_thread.start()
+            _server_initialized = True
+        except ValueError as ve:
+            # Firebase app already initialized
+            logging.warning(f"Firebase already initialized: {ve}")
+            pass
+        except Exception as e:
+            logging.error(f"Failed to initialize server: {e}")
 
+initialize_server()
+
+# ===== MAIN =====
 def main():
     try:
-        setup_firebase()
-        
-        # Send server started notification
-        send_server_started_notification()
-        
-        # Start market monitor in a separate thread
-        monitor_thread = threading.Thread(target=run_market_monitor, daemon=True)
-        monitor_thread.start()
-        
         # Run Flask server (blocking)
         port = int(os.environ.get("PORT", 5000))
         logging.info(f"Starting Flask API server on port {port}...")
