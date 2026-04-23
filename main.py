@@ -95,15 +95,28 @@ def is_market_open():
 
 def setup_firebase():
     try:
-        cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
+        cred = None
+        # Support loading from raw JSON string in env var (Best for Render)
+        firebase_env_json = os.getenv("FIREBASE_CREDENTIALS")
+        if firebase_env_json:
+            import json
+            cred_dict = json.loads(firebase_env_json)
+            cred = credentials.Certificate(cred_dict)
+        elif SERVICE_ACCOUNT_FILE and os.path.exists(SERVICE_ACCOUNT_FILE):
+            cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
+        else:
+            logging.error("FATAL: No Firebase credentials found. Please set FIREBASE_CREDENTIALS env var.")
+            return
+
         initialize_app(cred, {
             'databaseURL': FIREBASE_DB_URL
         })
         logging.info("Firebase Connected.")
     except Exception as e:
         logging.error(f"Failed to connect to Firebase: {e}")
-        send_error_notification(f"Failed to connect to Firebase: {str(e)}", "Firebase Error")
-        exit(1)
+        # Do not try to send notification if firebase failed, it causes a loop
+        # exit(1) # Re-raise instead so it doesn't quietly fail
+        raise
 
 def login_angel_one():
     try:
