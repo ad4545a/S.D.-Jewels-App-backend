@@ -443,6 +443,70 @@ def send_test_notification():
 
 # ===== MARKET MONITORING LOOP =====
 
+def reminder_service_loop():
+    """Background loop to check and send scheduled reminders"""
+    logging.info("Reminder service thread started.")
+    while True:
+        try:
+            now = get_ist_time()
+            reminders_ref = db.reference("reminders")
+            
+            # 1. Hardcoded one-off reminder as requested by user
+            # "i have to collect mony through pk jewellers" on 2027-04-23
+            pk_reminder_key = "pk_jewellers_payment_reminder"
+            stored = reminders_ref.child(pk_reminder_key).get()
+            
+            if not stored:
+                reminders_ref.child(pk_reminder_key).set({
+                    "target_date": "2027-04-23",
+                    "content": "i have to collect mony through pk jewellers",
+                    "sent": False,
+                    "count": 10,
+                    "created_at": str(now)
+                })
+            
+            # 2. Check for all pending reminders
+            reminders = reminders_ref.get()
+            if reminders:
+                for rid, rdata in reminders.items():
+                    if isinstance(rdata, dict) and not rdata.get("sent"):
+                        try:
+                            target_date_str = rdata.get("target_date")
+                            if not target_date_str: continue
+                            
+                            target_dt = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+                            
+                            if now.date() >= target_dt:
+                                logging.info(f"Executing scheduled reminder: {rid}")
+                                content = rdata.get("content", "Reminder Alert")
+                                count = rdata.get("count", 1)
+                                
+                                # Import inside loop to avoid circular dependancy if any
+                                from notification_service import send_email
+                                
+                                success_all = True
+                                for i in range(count):
+                                   logging.info(f"Sending email {i+1}/{count} for reminder {rid}")
+                                   # Using the existing email logic in notification_service
+                                   success = send_email(f"IMPORTANT REMINDER: {content[:30]}...", content)
+                                   if not success: success_all = False
+                                   time.sleep(2) # Rate limit protection
+                                
+                                # Mark as sent if at least one attempt was made
+                                reminders_ref.child(rid).update({
+                                    "sent": True, 
+                                    "sent_at": str(now),
+                                    "delivery_status": "Success" if success_all else "Partial/Failed"
+                                })
+                        except Exception as inner_e:
+                            logging.error(f"Error processing reminder {rid}: {inner_e}")
+
+        except Exception as e:
+            logging.error(f"Error in reminder service loop: {e}")
+            
+        # Check every 6 hours
+        time.sleep(21600)
+
 def run_market_monitor():
     """Main market monitoring loop"""
     try:
@@ -682,6 +746,11 @@ def initialize_server():
             # Start market monitor in a separate thread
             monitor_thread = threading.Thread(target=run_market_monitor, daemon=True)
             monitor_thread.start()
+
+            # Start reminder service in a separate thread
+            reminder_thread = threading.Thread(target=reminder_service_loop, daemon=True)
+            reminder_thread.start()
+            
             _server_initialized = True
         except ValueError as ve:
             # Firebase app already initialized
