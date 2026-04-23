@@ -122,19 +122,25 @@ def login_angel_one():
 
 def get_live_prices(smartApiObj):
     # Fetching Best Ask, High, Low
-    token_gold = "449534" # GOLD05FEB26FUT
-    token_silver = "451666" # SILVER05MAR26FUT
+    # OLD / CURRENT (As per user generic request)
+    token_gold = "454818"   # GOLD02APR26FUT (Expires: 02 Apr 2026)
+    token_silver = "457532" # SILVER05MAY26FUT (Expires: 05 May 2026) ← Updated from expired MAR26
+    # NOTE: token_gold_new / token_silver_new are the same tokens for now.
+    # If a new rollover contract is needed, update these to a different token.
+    token_gold_new = token_gold
+    token_silver_new = token_silver  # Same contract for now; update when rolling over
+
     token_usdinr = "1" # USDINR Spot Rate
     
-    gold_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0}
-    silver_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0}
+    gold_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0, "price_new": 0.0}
+    silver_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0, "price_new": 0.0}
     usd_data_out = {"price": 0.0}
 
     try:
         # Combine Request for MCX (Gold + Silver) and CDS (USDINR)
         # Using FULL mode for all to ensure we get Depth for MCX
         tokens = {
-            "MCX": [token_gold, token_silver],
+            "MCX": [token_gold, token_silver, token_gold_new, token_silver_new],
             "CDS": [token_usdinr]
         }
         
@@ -148,10 +154,18 @@ def get_live_prices(smartApiObj):
                 
                 # Determine if this is Gold, Silver, or USDINR
                 target_dict = None
+                is_new_contract = False
+
                 if sym_token == token_gold:
                     target_dict = gold_data_out
+                elif sym_token == token_gold_new:
+                    target_dict = gold_data_out
+                    is_new_contract = True
                 elif sym_token == token_silver:
                     target_dict = silver_data_out
+                elif sym_token == token_silver_new:
+                    target_dict = silver_data_out
+                    is_new_contract = True
                 elif sym_token == token_usdinr:
                     # Special case for USDINR, we only really need LTP but FULL gives it too
                     # If target_dict is usd_data_out, we handle it slightly differently below
@@ -159,23 +173,32 @@ def get_live_prices(smartApiObj):
                     pass 
 
                 # Process MCX Data
-                if sym_token in [token_gold, token_silver]:
-                    # Ask Price (Sell Depth)
+                if target_dict and sym_token in [token_gold, token_silver, token_gold_new, token_silver_new]:
+                    # For NEW contracts, we primarily just want the price for now
+                    # For OLD contracts, we want price, bid, high, low
+
+                    price = float(item.get('ltp', 0.0))
+                    
+                    # Try depth if LTP is suspicious or 0 (though LTP is usually reliable in API)
                     depth_sell = item.get('depth', {}).get('sell', [])
                     if depth_sell:
-                        target_dict['price'] = float(depth_sell[0]['price'])
+                        depth_price = float(depth_sell[0]['price'])
+                        if depth_price > 0: price = depth_price  # Use Ask if available
+                    
+                    if is_new_contract:
+                        target_dict['price_new'] = price
                     else:
-                        target_dict['price'] = float(item.get('ltp', 0.0))
+                         target_dict['price'] = price
+                         
+                         # Bid Price (Buy Depth)
+                         depth_buy = item.get('depth', {}).get('buy', [])
+                         if depth_buy:
+                              target_dict['bid'] = float(depth_buy[0]['price'])
+                         else:
+                              target_dict['bid'] = float(item.get('ltp', 0.0))
 
-                    # Bid Price (Buy Depth)
-                    depth_buy = item.get('depth', {}).get('buy', [])
-                    if depth_buy:
-                         target_dict['bid'] = float(depth_buy[0]['price'])
-                    else:
-                         target_dict['bid'] = float(item.get('ltp', 0.0))
-
-                    target_dict['high'] = float(item.get('high', 0.0))
-                    target_dict['low'] = float(item.get('low', 0.0))
+                         target_dict['high'] = float(item.get('high', 0.0))
+                         target_dict['low'] = float(item.get('low', 0.0))
                 
                 # Process USDINR Data
                 elif sym_token == token_usdinr:
@@ -277,8 +300,70 @@ def update_app_status():
             'data': payload
         })
 
+
     except Exception as e:
         logging.error(f"Error setting app status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/update-margins', methods=['POST'])
+def update_margins():
+    """Admin API to update margins/premiums"""
+    try:
+        data = request.get_json()
+        
+        # We expect a flat key-value pair or specific structure. 
+        # To be flexible, we will update whatever keys are sent under 'margins'.
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Fetch current settings first to merge or just update provided keys
+        ref = db.reference('admin_settings/margins')
+        
+        # Validate keys if strict mode is needed, but for now allow dynamic updates 
+        # conforming to what the apps send (gold_999, silver_9999, etc.)
+        
+        # Convert numeric values if they come as strings
+        cleaned_data = {}
+        for k, v in data.items():
+            try:
+                # If it looks like a number, save as number
+                cleaned_data[k] = float(v)
+            except:
+                cleaned_data[k] = v
+                
+        ref.update(cleaned_data)
+        
+        logging.info(f"Margins Updated via API: {cleaned_data}")
+        
+        # Also update ticker if present in payload (it might be sent separately or together)
+        if 'ticker_text' in data:
+            db.reference('admin_settings').update({'ticker_text': data['ticker_text']})
+            logging.info(f"Ticker Updated (Global): {data['ticker_text']}")
+
+        # Yash Traders Targeted Ticker Update
+        if 'yash_ticker_text' in data:
+            db.reference('yash_traders_settings').update({'ticker_text': data['yash_ticker_text']})
+            logging.info(f"Yash Traders Ticker Updated (Targeted): {data['yash_ticker_text']}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Settings updated successfully',
+            'data': cleaned_data
+        })
+
+    except Exception as e:
+        logging.error(f"Error updating margins: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/get-settings', methods=['GET'])
+def get_settings():
+    """Get current admin settings"""
+    try:
+        ref = db.reference('admin_settings')
+        data = ref.get() or {}
+        return jsonify(data)
+    except Exception as e:
+        logging.error(f"Error fetching settings: {e}")
         return jsonify({'error': str(e)}), 500
 
 # ===== FLASK API ENDPOINTS =====
@@ -490,9 +575,17 @@ def run_market_monitor():
                 # Determine status string
                 status_str = 'Live' if market_open else 'Market Closed'
                 
+                # Helper to get valid new price or fallback to old
+                g_new = last_gold.get('price_new', 0)
+                if g_new <= 0: g_new = gold_mcx
+                
+                s_new = last_silver.get('price_new', 0)
+                if s_new <= 0: s_new = silver_mcx
+
                 payload = {
                     'gold': {
                         'mcx_price': gold_mcx,
+                        'mcx_price_new': g_new, # NEW PRICE (Safe)
                         'bid': last_gold.get('bid', gold_mcx - 10), # Include BID
                         'rate_999': gold_999,
                         'rate_9950': gold_9950,
@@ -502,7 +595,9 @@ def run_market_monitor():
                     },
                     'silver': {
                         'mcx_price': silver_mcx,
+                        'mcx_price_new': s_new, # NEW PRICE (Safe)
                         'bid': last_silver.get('bid', silver_mcx - 50), # Include BID
+                        'ask': silver_mcx, # Explicitly include Ask (Ask is Main/Price)
                         'rate_9999': silver_9999,
                         'rate_bars': silver_bars,
                         'spot_price': round(silver_spot, 2),
@@ -576,8 +671,9 @@ def main():
         monitor_thread.start()
         
         # Run Flask server (blocking)
-        logging.info("Starting Flask API server on port 5000...")
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        port = int(os.environ.get("PORT", 5000))
+        logging.info(f"Starting Flask API server on port {port}...")
+        app.run(host='0.0.0.0', port=port, debug=False)
         
     except Exception as e:
         error_msg = f"Fatal error: {str(e)}"
