@@ -136,8 +136,8 @@ def login_angel_one():
 def get_live_prices(smartApiObj):
     # Fetching Best Ask, High, Low
     # OLD / CURRENT (As per user generic request)
-    token_gold = "454818"   # GOLD02APR26FUT (Expires: 02 Apr 2026)
-    token_silver = "457532" # SILVER05MAY26FUT (Expires: 05 May 2026) ← Updated from expired MAR26
+    token_gold = "459277"   # GOLD05JUN26FUT (Expires: 05 Jun 2026)
+    token_silver = "464150" # SILVER03JUL26FUT (Expires: 03 Jul 2026)
     # NOTE: token_gold_new / token_silver_new are the same tokens for now.
     # If a new rollover contract is needed, update these to a different token.
     token_gold_new = token_gold
