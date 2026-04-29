@@ -5,6 +5,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from firebase_admin import messaging
+from concurrent.futures import ThreadPoolExecutor
 
 ADMIN_TOKENS_FILE = "admin_tokens.json"
 
