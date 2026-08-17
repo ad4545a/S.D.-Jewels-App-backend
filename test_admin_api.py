@@ -5,8 +5,8 @@ import time
 # Configuration
 # If testing locally, ensure main.py is running.
 # If testing against VPS, use the VPS IP.
-BASE_URL = "http://127.0.0.1:5000" 
-# BASE_URL = "https://s-d-jewels-app-backend.onrender.com"
+# BASE_URL = "http://127.0.0.1:5000" 
+BASE_URL = "https://s-d-jewels-app-backend.onrender.com"
 
 def test_get_settings():
     print(f"Testing GET {BASE_URL}/admin/get-settings...")

@@ -40,9 +40,74 @@ SERVICE_ACCOUNT_FILE = os.getenv("FIREBASE_KEY_PATH")
 EXCHANGE = "MCX"
 SYMBOL_GOLD = "GOLD" 
 SYMBOL_SILVER = "SILVER"
-# Note: For real trading, you need the instrument tokens. 
-# We will implement a lookup or you must provide tokens.
-# For now, we'll try to fetch tokens or use placeholders.
+
+# Dynamic token variables (initially loaded with fallbacks)
+token_gold = "483079"   # GOLD05OCT26FUT (Expires: 05 Oct 2026)
+token_silver = "471725" # SILVER04SEP26FUT (Expires: 04 Sep 2026)
+token_gold_new = "495213"   # GOLD04DEC26FUT (Expires: 04 Dec 2026)
+token_silver_new = "495214" # SILVER04DEC26FUT (Expires: 04 Dec 2026)
+token_usdinr = "1" # USDINR Spot Rate
+last_token_update_date = None
+
+import urllib.request
+
+def update_tokens_dynamically():
+    global token_gold, token_silver, token_gold_new, token_silver_new, last_token_update_date
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    logging.info("Updating gold and silver tokens dynamically from Scrip Master...")
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode())
+            scrips = [d for d in data if d.get('exch_seg') == 'MCX']
+            
+            def parse_date(date_str):
+                try:
+                    return datetime.datetime.strptime(date_str, "%d%b%Y").date()
+                except:
+                    return datetime.date.max
+
+            today = datetime.date.today()
+            
+            # Gold futures candidates
+            gold_candidates = [
+                d for d in scrips 
+                if d.get('name') == 'GOLD' and d.get('instrumenttype') == 'FUTCOM'
+            ]
+            gold_candidates.sort(key=lambda x: parse_date(x.get('expiry', '')))
+            gold_valid = [c for c in gold_candidates if parse_date(c.get('expiry', '')) >= today]
+            
+            # Silver futures candidates
+            silver_candidates = [
+                d for d in scrips 
+                if d.get('name') == 'SILVER' and d.get('instrumenttype') == 'FUTCOM'
+            ]
+            silver_candidates.sort(key=lambda x: parse_date(x.get('expiry', '')))
+            silver_valid = [c for c in silver_candidates if parse_date(c.get('expiry', '')) >= today]
+            
+            if len(gold_valid) >= 1:
+                token_gold = gold_valid[0]['token']
+                logging.info(f"Dynamic Gold Token Updated: {token_gold} ({gold_valid[0]['symbol']})")
+                if len(gold_valid) >= 2:
+                    token_gold_new = gold_valid[1]['token']
+                    logging.info(f"Dynamic Gold New Token Updated: {token_gold_new} ({gold_valid[1]['symbol']})")
+                else:
+                    token_gold_new = token_gold
+            
+            if len(silver_valid) >= 1:
+                token_silver = silver_valid[0]['token']
+                logging.info(f"Dynamic Silver Token Updated: {token_silver} ({silver_valid[0]['symbol']})")
+                if len(silver_valid) >= 2:
+                    token_silver_new = silver_valid[1]['token']
+                    logging.info(f"Dynamic Silver New Token Updated: {token_silver_new} ({silver_valid[1]['symbol']})")
+                else:
+                    token_silver_new = token_silver
+            
+            last_token_update_date = today
+            logging.info("Dynamic token update completed successfully.")
+            
+    except Exception as e:
+        logging.error(f"Failed to update tokens dynamically: {e}. Using current/fallback tokens.")
 
 # Time Rules
 START_HOUR = 9   # 9 AM
@@ -134,16 +199,8 @@ def login_angel_one():
         return None
 
 def get_live_prices(smartApiObj):
-    # Fetching Best Ask, High, Low
-    # OLD / CURRENT (As per user generic request)
-    token_gold = "459277"   # GOLD05JUN26FUT (Expires: 05 Jun 2026)
-    token_silver = "464150" # SILVER03JUL26FUT (Expires: 03 Jul 2026)
-    # NOTE: token_gold_new / token_silver_new are the same tokens for now.
-    # If a new rollover contract is needed, update these to a different token.
-    token_gold_new = token_gold
-    token_silver_new = token_silver  # Same contract for now; update when rolling over
-
-    token_usdinr = "1" # USDINR Spot Rate
+    # Fetching Best Ask, High, Low using global dynamic tokens
+    global token_gold, token_silver, token_gold_new, token_silver_new, token_usdinr
     
     gold_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0, "price_new": 0.0}
     silver_data_out = {"price": 0.0, "high": 0.0, "low": 0.0, "bid": 0.0, "price_new": 0.0}
@@ -510,6 +567,12 @@ def reminder_service_loop():
 def run_market_monitor():
     """Main market monitoring loop"""
     try:
+        # Initial dynamic token update on startup
+        try:
+            update_tokens_dynamically()
+        except Exception as e:
+            logging.error(f"Failed initial dynamic token update: {e}")
+
         smartApi = login_angel_one()
         
         # Load last known values from Firebase instead of hardcoded defaults
@@ -561,6 +624,14 @@ def run_market_monitor():
 
         while True:
             try:
+                # Daily token update check
+                today = datetime.date.today()
+                if last_token_update_date != today:
+                    try:
+                        update_tokens_dynamically()
+                    except Exception as e:
+                        logging.error(f"Failed daily dynamic token update: {e}")
+
                 market_open = is_market_open()
                 
                 # Check for State Transition
